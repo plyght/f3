@@ -1,0 +1,10 @@
+f3
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+core
+core.*
+.DS_Store
+vendor/fff/target/
