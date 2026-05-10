@@ -21,6 +21,8 @@ typedef struct App {
     size_t query_len;
     uint32_t selected;
     FffSearchResult *result;
+    FffGrepResult *grep_result;
+    bool grep_mode;
     struct termios original_termios;
     bool raw;
     int rows;
@@ -49,6 +51,10 @@ static void free_result(App *app) {
         fff_free_search_result(app->result);
         app->result = NULL;
     }
+    if (app->grep_result) {
+        fff_free_grep_result(app->grep_result);
+        app->grep_result = NULL;
+    }
 }
 
 static void check_result(FffResult *result, const char *operation) {
@@ -62,17 +68,25 @@ static void check_result(FffResult *result, const char *operation) {
 
 static void refresh(App *app) {
     free_result(app);
-    FffResult *result = fff_search(app->fff, app->query, NULL, 0, 0, 200, 0, 0);
-    check_result(result, "search");
-    app->result = result->handle;
+    FffResult *result;
+    if (app->grep_mode) {
+        result = fff_live_grep(app->fff, app->query, 0, 0, 0, true, 0, 200, 100, 0, 0, false);
+        check_result(result, "grep");
+        app->grep_result = result->handle;
+    } else {
+        result = fff_search(app->fff, app->query, NULL, 0, 0, 200, 0, 0);
+        check_result(result, "search");
+        app->result = result->handle;
+    }
     fff_free_result(result);
-    if (app->result && app->selected >= app->result->count) app->selected = app->result->count ? app->result->count - 1 : 0;
+    uint32_t count = app->grep_mode ? (app->grep_result ? app->grep_result->count : 0) : (app->result ? app->result->count : 0);
+    if (app->selected >= count) app->selected = count ? count - 1 : 0;
 }
 
 static void create_fff(App *app, bool watch) {
     char cwd[4096];
     if (!getcwd(cwd, sizeof(cwd))) die("could not read current directory");
-    FffResult *result = fff_create_instance2(cwd, NULL, NULL, false, true, true, watch, false, NULL, NULL, 0, 0, 0);
+    FffResult *result = fff_create_instance2(cwd, NULL, NULL, false, true, false, watch, false, NULL, NULL, 0, 0, 0);
     check_result(result, "create instance");
     app->fff = result->handle;
     fff_free_result(result);
@@ -137,11 +151,11 @@ static void draw(App *app) {
     update_size(app);
     char buf[1024];
     write_all("\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[H\x1b[2K");
-    snprintf(buf, sizeof(buf), "› %s", app->query_len ? app->query : "");
+    snprintf(buf, sizeof(buf), "%s › %s", app->grep_mode ? "grep" : "files", app->query_len ? app->query : "");
     draw_line(buf, app->cols);
     write_all("\r\n");
 
-    uint32_t count = app->result ? app->result->count : 0;
+    uint32_t count = app->grep_mode ? (app->grep_result ? app->grep_result->count : 0) : (app->result ? app->result->count : 0);
     int list_rows = app->rows - 3;
     uint32_t start = 0;
     if (app->selected >= (uint32_t)list_rows) start = app->selected - (uint32_t)list_rows + 1;
@@ -149,9 +163,14 @@ static void draw(App *app) {
     for (int row = 0; row < list_rows; row++) {
         uint32_t index = start + (uint32_t)row;
         if (index < count) {
-            FffFileItem *item = &app->result->items[index];
             if (index == app->selected) write_all("\x1b[7m");
-            snprintf(buf, sizeof(buf), " %s %s", index == app->selected ? "›" : " ", item->relative_path);
+            if (app->grep_mode) {
+                FffGrepMatch *item = &app->grep_result->items[index];
+                snprintf(buf, sizeof(buf), " %s %s:%llu:%u: %s", index == app->selected ? "›" : " ", item->relative_path, (unsigned long long)item->line_number, item->col, item->line_content);
+            } else {
+                FffFileItem *item = &app->result->items[index];
+                snprintf(buf, sizeof(buf), " %s %s", index == app->selected ? "›" : " ", item->relative_path);
+            }
             draw_line(buf, app->cols);
             write_all("\x1b[0m\r\n");
         } else {
@@ -160,7 +179,7 @@ static void draw(App *app) {
         }
     }
 
-    snprintf(buf, sizeof(buf), " %u results · enter open · esc quit", count);
+    snprintf(buf, sizeof(buf), " %u results · ctrl-g %s · enter open · esc quit", count, app->grep_mode ? "files" : "grep");
     draw_line(buf, app->cols);
 }
 
@@ -187,15 +206,18 @@ static int read_key(void) {
     return c;
 }
 
-static void open_path(const char *path) {
+static void open_path_at(const char *path, uint64_t line) {
     const char *editor = getenv("EDITOR");
     if (!editor || !editor[0]) editor = "vi";
+    char line_arg[64];
+    snprintf(line_arg, sizeof(line_arg), "+%llu", (unsigned long long)line);
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "f3: could not open %s: %s\n", path, strerror(errno));
         return;
     }
     if (pid == 0) {
+        if (line) execlp(editor, editor, line_arg, path, (char *)NULL);
         execlp(editor, editor, path, (char *)NULL);
         fprintf(stderr, "f3: could not run editor %s: %s\n", editor, strerror(errno));
         _exit(127);
@@ -204,8 +226,17 @@ static void open_path(const char *path) {
     while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
 }
 
+static void open_path(const char *path) {
+    open_path_at(path, 0);
+}
+
 static void open_selected(App *app) {
-    if (app->result && app->result->count && app->selected < app->result->count) {
+    if (app->grep_mode) {
+        if (app->grep_result && app->grep_result->count && app->selected < app->grep_result->count) {
+            FffGrepMatch *item = &app->grep_result->items[app->selected];
+            open_path_at(item->relative_path, item->line_number);
+        }
+    } else if (app->result && app->result->count && app->selected < app->result->count) {
         open_path(app->result->items[app->selected].relative_path);
     }
 }
@@ -223,6 +254,12 @@ static void run_tui(App *app) {
             open_selected(app);
             return;
         }
+        if (key == 7) {
+            app->grep_mode = !app->grep_mode;
+            app->selected = 0;
+            refresh(app);
+            continue;
+        }
         if (key == 127 || key == 8) {
             if (app->query_len) app->query[--app->query_len] = '\0';
             app->selected = 0;
@@ -234,7 +271,8 @@ static void run_tui(App *app) {
             continue;
         }
         if (key == 1001) {
-            if (app->result && app->selected + 1 < app->result->count) app->selected++;
+            uint32_t count = app->grep_mode ? (app->grep_result ? app->grep_result->count : 0) : (app->result ? app->result->count : 0);
+            if (app->selected + 1 < count) app->selected++;
             continue;
         }
         if (isprint(key) && app->query_len + 1 < sizeof(app->query)) {
@@ -257,14 +295,41 @@ static int run_cli(App *app, const char *query) {
     return 0;
 }
 
+static int run_cli_grep(App *app, const char *query) {
+    FffResult *result = fff_live_grep(app->fff, query, 0, 0, 0, true, 0, 50, 0, 0, 0, false);
+    check_result(result, "grep");
+    FffGrepResult *grep = result->handle;
+    fff_free_result(result);
+    for (uint32_t i = 0; grep && i < grep->count; i++) {
+        FffGrepMatch *item = &grep->items[i];
+        printf("%s:%llu:%u: %s\n", item->relative_path, (unsigned long long)item->line_number, item->col, item->line_content);
+    }
+    if (grep) fff_free_grep_result(grep);
+    return 0;
+}
+
+static bool is_f3g(const char *arg0) {
+    const char *name = strrchr(arg0, '/');
+    name = name ? name + 1 : arg0;
+    return strcmp(name, "f3g") == 0;
+}
+
 int main(int argc, char **argv) {
+    bool grep_mode = is_f3g(argv[0]);
+    int query_start = 1;
+    if (argc > 1 && (strcmp(argv[1], "-g") == 0 || strcmp(argv[1], "--grep") == 0)) {
+        grep_mode = true;
+        query_start = 2;
+    }
+
     App app;
     memset(&app, 0, sizeof(app));
-    create_fff(&app, argc == 1);
+    app.grep_mode = grep_mode;
+    create_fff(&app, argc == query_start);
     int exit_code = 0;
-    if (argc > 1) {
-        char *query = join_query(argc, argv, 1);
-        exit_code = run_cli(&app, query);
+    if (argc > query_start) {
+        char *query = join_query(argc, argv, query_start);
+        exit_code = grep_mode ? run_cli_grep(&app, query) : run_cli(&app, query);
         free(query);
     } else {
         run_tui(&app);
